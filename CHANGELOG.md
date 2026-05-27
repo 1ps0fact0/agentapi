@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.12.2
+
+### Fixes
+- drop x\b workaround for fixed Claude Code 0.2.70 paste-echo bug
+
 ## v0.12.1
 
 ### Fixes
