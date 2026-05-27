@@ -4,6 +4,9 @@
 
 ### Fixes
 - drop x\b workaround for fixed Claude Code 0.2.70 paste-echo bug
+- handle partial/malformed tool call detection for claude-code
+- exorcise goroutine-leaking util.After from the codebase
+- make writeStabilize Phase 1 non-fatal when agents don't echo input
 
 ## v0.12.1
 
