@@ -234,6 +234,7 @@ func TestServerCmd_AllArgs_Defaults(t *testing.T) {
 		{"term-height default", FlagTermHeight, uint16(1000), func() any { return viper.GetUint16(FlagTermHeight) }},
 		{"allowed-hosts default", FlagAllowedHosts, []string{"localhost", "127.0.0.1", "[::1]"}, func() any { return viper.GetStringSlice(FlagAllowedHosts) }},
 		{"allowed-origins default", FlagAllowedOrigins, []string{"http://localhost:3284", "http://localhost:3000", "http://localhost:3001"}, func() any { return viper.GetStringSlice(FlagAllowedOrigins) }},
+		{"bind-address default", FlagBindAddress, "", func() any { return viper.GetString(FlagBindAddress) }},
 	}
 
 	for _, tt := range tests {
@@ -268,6 +269,7 @@ func TestServerCmd_AllEnvVars(t *testing.T) {
 		{"AGENTAPI_TERM_HEIGHT", "AGENTAPI_TERM_HEIGHT", "500", uint16(500), func() any { return viper.GetUint16(FlagTermHeight) }},
 		{"AGENTAPI_ALLOWED_HOSTS", "AGENTAPI_ALLOWED_HOSTS", "localhost example.com", []string{"localhost", "example.com"}, func() any { return viper.GetStringSlice(FlagAllowedHosts) }},
 		{"AGENTAPI_ALLOWED_ORIGINS", "AGENTAPI_ALLOWED_ORIGINS", "https://example.com http://localhost:3000", []string{"https://example.com", "http://localhost:3000"}, func() any { return viper.GetStringSlice(FlagAllowedOrigins) }},
+		{"AGENTAPI_BIND_ADDRESS", "AGENTAPI_BIND_ADDRESS", "127.0.0.1", "127.0.0.1", func() any { return viper.GetString(FlagBindAddress) }},
 	}
 
 	for _, tt := range tests {
@@ -344,6 +346,13 @@ func TestServerCmd_ArgsPrecedenceOverEnv(t *testing.T) {
 			[]string{"--allowed-origins", "https://cli-example.com"},
 			[]string{"https://cli-example.com"},
 			func() any { return viper.GetStringSlice(FlagAllowedOrigins) },
+		},
+		{
+			"bind-address: CLI overrides env",
+			"AGENTAPI_BIND_ADDRESS", "0.0.0.0",
+			[]string{"--bind-address", "127.0.0.1"},
+			"127.0.0.1",
+			func() any { return viper.GetString(FlagBindAddress) },
 		},
 	}
 
@@ -798,4 +807,65 @@ func TestServerCmd_AllowedOrigins(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServerCmd_BindAddress(t *testing.T) {
+	t.Run("flag parsed", func(t *testing.T) {
+		isolateViper(t)
+
+		serverCmd := CreateServerCmd()
+		setupCommandOutput(t, serverCmd)
+		serverCmd.SetArgs([]string{"--bind-address", "127.0.0.1", "--exit", "dummy-command"})
+		require.NoError(t, serverCmd.Execute())
+
+		assert.Equal(t, "127.0.0.1", viper.GetString(FlagBindAddress))
+	})
+
+	t.Run("ipv6 literal parsed", func(t *testing.T) {
+		isolateViper(t)
+
+		serverCmd := CreateServerCmd()
+		setupCommandOutput(t, serverCmd)
+		serverCmd.SetArgs([]string{"--bind-address", "::1", "--exit", "dummy-command"})
+		require.NoError(t, serverCmd.Execute())
+
+		assert.Equal(t, "::1", viper.GetString(FlagBindAddress))
+	})
+
+	t.Run("bind-address is independent of allowed-hosts", func(t *testing.T) {
+		isolateViper(t)
+
+		serverCmd := CreateServerCmd()
+		setupCommandOutput(t, serverCmd)
+		serverCmd.SetArgs([]string{"--bind-address", "127.0.0.1", "--exit", "dummy-command"})
+		require.NoError(t, serverCmd.Execute())
+
+		// Setting --bind-address must not rewrite the allowed-hosts list.
+		assert.Equal(t, "127.0.0.1", viper.GetString(FlagBindAddress))
+		assert.Equal(t, []string{"localhost", "127.0.0.1", "[::1]"}, viper.GetStringSlice(FlagAllowedHosts))
+	})
+
+	t.Run("allowed-hosts override does not affect bind-address", func(t *testing.T) {
+		isolateViper(t)
+
+		serverCmd := CreateServerCmd()
+		setupCommandOutput(t, serverCmd)
+		serverCmd.SetArgs([]string{"--allowed-hosts", "example.com", "--exit", "dummy-command"})
+		require.NoError(t, serverCmd.Execute())
+
+		// Changing --allowed-hosts must not implicitly set a bind address.
+		assert.Equal(t, []string{"example.com"}, viper.GetStringSlice(FlagAllowedHosts))
+		assert.Equal(t, "", viper.GetString(FlagBindAddress))
+	})
+
+	t.Run("--host flag is not defined", func(t *testing.T) {
+		isolateViper(t)
+
+		serverCmd := CreateServerCmd()
+		setupCommandOutput(t, serverCmd)
+		serverCmd.SetArgs([]string{"--host", "127.0.0.1", "--exit", "dummy-command"})
+		err := serverCmd.Execute()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unknown flag: --host")
+	})
 }

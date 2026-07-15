@@ -134,6 +134,30 @@ agentapi server --allowed-origins 'https://example.com,http://localhost:3000' --
 AGENTAPI_ALLOWED_ORIGINS='https://example.com http://localhost:3000' agentapi server -- claude
 ```
 
+#### Bind address
+
+By default, the server binds all network interfaces (`:3284`). Use the `--bind-address` flag or the `AGENTAPI_BIND_ADDRESS` environment variable to restrict the listening socket to a specific address. Leaving it empty preserves the default of binding all interfaces.
+
+To bind only the IPv4 loopback interface so the server is reachable only from the local machine:
+
+```bash
+agentapi server --bind-address 127.0.0.1 --type=claude
+# or
+AGENTAPI_BIND_ADDRESS=127.0.0.1 agentapi server --type=claude
+```
+
+You can also bind the IPv6 loopback interface:
+
+```bash
+agentapi server --bind-address ::1 --type=claude
+```
+
+`--bind-address` controls the kernel listening socket (which addresses can connect at all). This is a separate control from `--allowed-hosts`, which validates the HTTP `Host` header after a connection has been accepted. Setting `--bind-address` does not change the allowed-hosts list, and the two can be configured independently. For example, to listen only on loopback while still restricting the accepted `Host` header:
+
+```bash
+agentapi server --bind-address 127.0.0.1 --allowed-hosts localhost --type=claude
+```
+
 ### `agentapi attach`
 
 Attach to a running agent's terminal session.

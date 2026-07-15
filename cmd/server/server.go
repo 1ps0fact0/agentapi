@@ -196,6 +196,7 @@ func runServer(ctx context.Context, logger *slog.Logger, argsToPass []string) er
 		AgentIO:        agentIO,
 		Transport:      httpapi.Transport(transport),
 		Port:           port,
+		BindAddress:    viper.GetString(FlagBindAddress),
 		ChatBasePath:   viper.GetString(FlagChatBasePath),
 		AllowedHosts:   viper.GetStringSlice(FlagAllowedHosts),
 		AllowedOrigins: viper.GetStringSlice(FlagAllowedOrigins),
@@ -382,6 +383,7 @@ const (
 	FlagSaveState       = "save-state"
 	FlagPidFile         = "pid-file"
 	FlagExperimentalACP = "experimental-acp"
+	FlagBindAddress     = "bind-address"
 )
 
 func CreateServerCmd() *cobra.Command {
@@ -425,6 +427,7 @@ func CreateServerCmd() *cobra.Command {
 		{FlagSaveState, "", false, "Save state to state-file on shutdown (defaults to true when state-file is set)", "bool"},
 		{FlagPidFile, "", "", "Path to file where the server process ID will be written for shutdown scripts", "string"},
 		{FlagExperimentalACP, "", false, "Use experimental ACP transport instead of PTY", "bool"},
+		{FlagBindAddress, "", "", "Network address the HTTP server binds to, such as 127.0.0.1 or ::1. Empty binds all interfaces. This controls the listening socket; use --allowed-hosts for HTTP Host-header validation.", "string"},
 	}
 
 	for _, spec := range flagSpecs {

@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +42,9 @@ type Server struct {
 	router       chi.Router
 	api          huma.API
 	port         int
+	bindAddress  string
 	srv          *http.Server
+	listener     net.Listener
 	mu           sync.RWMutex
 	stopOnce     sync.Once
 	logger       *slog.Logger
@@ -107,6 +111,7 @@ type ServerConfig struct {
 	AgentIO                st.AgentIO
 	Transport              Transport
 	Port                   int
+	BindAddress            string
 	ChatBasePath           string
 	AllowedHosts           []string
 	AllowedOrigins         []string
@@ -301,6 +306,7 @@ func NewServer(ctx context.Context, config ServerConfig) (*Server, error) {
 		router:       router,
 		api:          api,
 		port:         config.Port,
+		bindAddress:  config.BindAddress,
 		conversation: conversation,
 		logger:       logger,
 		agentio:      config.AgentIO,
@@ -614,15 +620,75 @@ func (s *Server) subscribeScreen(ctx context.Context, input *struct{}, send sse.
 	}
 }
 
-// Start starts the HTTP server
+// buildListenAddress combines a bind address and port into an address suitable
+// for net.Listen. An empty bind address preserves the historical behavior of
+// binding all interfaces (":<port>"). Host and port are always joined with
+// net.JoinHostPort so IPv4 addresses, IPv6 literals, and hostnames are handled
+// correctly; the host is never concatenated manually. A malformed bind address
+// returns an error rather than silently degrading to a wildcard bind.
+func buildListenAddress(bindAddress string, port int) (string, error) {
+	portStr := strconv.Itoa(port)
+	if bindAddress == "" {
+		// Preserve the existing wildcard listener (":<port>").
+		return net.JoinHostPort("", portStr), nil
+	}
+	host := bindAddress
+	// Normalize a single conventional bracketed IPv6 literal such as "[::1]" to
+	// "::1"; net.JoinHostPort re-adds the brackets below. Only accept the
+	// bracketed form when the inner value is unambiguously an IP literal.
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		inner := host[1 : len(host)-1]
+		if net.ParseIP(inner) == nil {
+			return "", xerrors.Errorf("invalid bind address %q: bracketed value is not a valid IP literal", bindAddress)
+		}
+		host = inner
+	}
+	// Reject any leftover brackets or an embedded port. A colon in the host is
+	// only legitimate when the entire value is an IPv6 literal (e.g. "::1").
+	if strings.ContainsAny(host, "[]") {
+		return "", xerrors.Errorf("invalid bind address %q: unexpected bracket", bindAddress)
+	}
+	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		return "", xerrors.Errorf("invalid bind address %q: must be a host or IP literal without a port", bindAddress)
+	}
+	return net.JoinHostPort(host, portStr), nil
+}
+
+// Start starts the HTTP server. It binds an explicit listener so the resolved
+// address can be logged and inspected, then serves requests until the server is
+// stopped. It returns http.ErrServerClosed after a graceful Stop.
 func (s *Server) Start() error {
-	addr := fmt.Sprintf(":%d", s.port)
-	s.srv = &http.Server{
-		Addr:    addr,
-		Handler: s.router,
+	addr, err := buildListenAddress(s.bindAddress, s.port)
+	if err != nil {
+		return xerrors.Errorf("failed to construct listen address: %w", err)
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return xerrors.Errorf("failed to listen on %q: %w", addr, err)
 	}
 
-	return s.srv.ListenAndServe()
+	srv := &http.Server{
+		Handler: s.router,
+	}
+	s.mu.Lock()
+	s.srv = srv
+	s.listener = listener
+	s.mu.Unlock()
+
+	s.logger.Info("HTTP server listening", "address", listener.Addr().String())
+
+	return srv.Serve(listener)
+}
+
+// Addr returns the actual network address the server is listening on, or nil if
+// the server has not started yet. Useful for tests that bind to port 0.
+func (s *Server) Addr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
 }
 
 // Stop gracefully stops the HTTP server. It is safe to call multiple times.
@@ -634,10 +700,21 @@ func (s *Server) Stop(ctx context.Context) error {
 		// Clean up temporary directory
 		s.cleanupTempDir()
 
-		if s.srv != nil {
-			if err = s.srv.Shutdown(ctx); errors.Is(err, http.ErrServerClosed) {
+		s.mu.RLock()
+		srv := s.srv
+		listener := s.listener
+		s.mu.RUnlock()
+
+		if srv != nil {
+			if err = srv.Shutdown(ctx); errors.Is(err, http.ErrServerClosed) {
 				err = nil
 			}
+		}
+		// http.Server.Shutdown closes listeners it is actively serving, but close
+		// explicitly as well to avoid leaking a listener that was created before
+		// Serve began. Closing an already-closed listener is harmless here.
+		if listener != nil {
+			_ = listener.Close()
 		}
 	})
 	return err

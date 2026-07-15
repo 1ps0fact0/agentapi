@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -956,6 +957,222 @@ func TestServer_UploadFiles_Errors(t *testing.T) {
 		require.NoError(t, err)
 		require.Contains(t, string(body), "file size exceeds 10MB limit")
 	})
+}
+
+// newListenerTestServer builds a server bound to the given address on an
+// ephemeral port (port 0) with no agent attached, so tests can exercise the
+// real listener without launching a coding agent.
+func newListenerTestServer(t *testing.T, bindAddress string) *httpapi.Server {
+	t.Helper()
+	ctx := logctx.WithLogger(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err := httpapi.NewServer(ctx, httpapi.ServerConfig{
+		AgentType:      msgfmt.AgentTypeClaude,
+		AgentIO:        nil,
+		Port:           0,
+		BindAddress:    bindAddress,
+		ChatBasePath:   "/chat",
+		AllowedHosts:   []string{"*"},
+		AllowedOrigins: []string{"*"},
+	})
+	require.NoError(t, err)
+	// Ensure the temp dir and any listener are cleaned up even if the test
+	// returns early. Stop is idempotent, so an explicit Stop later is fine.
+	t.Cleanup(func() {
+		_ = s.Stop(context.Background())
+	})
+	return s
+}
+
+// ipv6LoopbackAvailable reports whether the host can bind the IPv6 loopback.
+func ipv6LoopbackAvailable() bool {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+// startAndWait starts the server in a goroutine and blocks until it is
+// listening, returning the bound address and a channel carrying Start's result.
+func startAndWait(t *testing.T, s *httpapi.Server) (net.Addr, <-chan error) {
+	t.Helper()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Start()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if addr := s.Addr(); addr != nil {
+			return addr, errCh
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("server exited before listening: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the server to start listening")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestServer_ListenAddress exercises the listener-address construction end to
+// end: each bind address must resolve to the expected kind of socket, and a
+// malformed address must fail fast rather than silently binding all interfaces.
+func TestServer_ListenAddress(t *testing.T) {
+	ipv6 := ipv6LoopbackAvailable()
+
+	cases := []struct {
+		name        string
+		bindAddress string
+		wantErr     bool
+		needIPv6    bool
+		check       func(t *testing.T, ip net.IP)
+	}{
+		{
+			name:        "empty binds all interfaces",
+			bindAddress: "",
+			check: func(t *testing.T, ip net.IP) {
+				require.True(t, ip.IsUnspecified(), "expected wildcard/unspecified bind, got %s", ip)
+			},
+		},
+		{
+			name:        "ipv4 loopback",
+			bindAddress: "127.0.0.1",
+			check: func(t *testing.T, ip net.IP) {
+				require.True(t, ip.IsLoopback(), "expected loopback, got %s", ip)
+				require.NotNil(t, ip.To4(), "expected an IPv4 address, got %s", ip)
+			},
+		},
+		{
+			name:        "ipv6 loopback",
+			bindAddress: "::1",
+			needIPv6:    true,
+			check: func(t *testing.T, ip net.IP) {
+				require.True(t, ip.IsLoopback(), "expected loopback, got %s", ip)
+				require.Nil(t, ip.To4(), "expected an IPv6 address, got %s", ip)
+			},
+		},
+		{
+			name:        "bracketed ipv6 loopback",
+			bindAddress: "[::1]",
+			needIPv6:    true,
+			check: func(t *testing.T, ip net.IP) {
+				require.True(t, ip.IsLoopback(), "expected loopback, got %s", ip)
+				require.Nil(t, ip.To4(), "expected an IPv6 address, got %s", ip)
+			},
+		},
+		{
+			name:        "hostname localhost",
+			bindAddress: "localhost",
+			check: func(t *testing.T, ip net.IP) {
+				require.True(t, ip.IsLoopback(), "expected loopback, got %s", ip)
+			},
+		},
+		{
+			name:        "malformed host with embedded port",
+			bindAddress: "127.0.0.1:8080",
+			wantErr:     true,
+		},
+		{
+			name:        "malformed bracketed non-ip",
+			bindAddress: "[not-an-ip]",
+			wantErr:     true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.needIPv6 && !ipv6 {
+				t.Skip("IPv6 loopback not available on this host")
+			}
+			s := newListenerTestServer(t, tc.bindAddress)
+
+			if tc.wantErr {
+				// A malformed bind address must return an error and must never
+				// leave a listening wildcard socket behind.
+				err := s.Start()
+				require.Error(t, err)
+				require.Nil(t, s.Addr(), "malformed bind address must not create a listener")
+				return
+			}
+
+			addr, errCh := startAndWait(t, s)
+			tcpAddr, ok := addr.(*net.TCPAddr)
+			require.True(t, ok, "expected *net.TCPAddr, got %T", addr)
+			tc.check(t, tcpAddr.IP)
+
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, s.Stop(stopCtx))
+
+			select {
+			case err := <-errCh:
+				require.ErrorIs(t, err, http.ErrServerClosed)
+			case <-time.After(5 * time.Second):
+				t.Fatal("serving goroutine did not exit after Stop")
+			}
+		})
+	}
+}
+
+// TestServer_BoundListener is a bounded integration test that binds a real
+// listener on port 0, verifies the actual bound address, and confirms graceful
+// shutdown returns without leaking the listener or the serving goroutine. It
+// launches no coding agent and never binds a fixed port.
+func TestServer_BoundListener(t *testing.T) {
+	ipv6 := ipv6LoopbackAvailable()
+
+	cases := []struct {
+		name        string
+		bindAddress string
+		needIPv6    bool
+	}{
+		{"ipv4 loopback", "127.0.0.1", false},
+		{"ipv6 loopback", "::1", true},
+		{"default remains wildcard", "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.needIPv6 && !ipv6 {
+				t.Skip("IPv6 loopback not available on this host")
+			}
+			s := newListenerTestServer(t, tc.bindAddress)
+			addr, errCh := startAndWait(t, s)
+
+			tcpAddr, ok := addr.(*net.TCPAddr)
+			require.True(t, ok, "expected *net.TCPAddr, got %T", addr)
+			require.NotZero(t, tcpAddr.Port, "expected an ephemeral port to be assigned")
+
+			switch tc.bindAddress {
+			case "127.0.0.1":
+				require.True(t, tcpAddr.IP.IsLoopback(), "expected loopback, got %s", tcpAddr.IP)
+				require.NotNil(t, tcpAddr.IP.To4(), "expected an IPv4 address, got %s", tcpAddr.IP)
+			case "::1":
+				require.True(t, tcpAddr.IP.IsLoopback(), "expected loopback, got %s", tcpAddr.IP)
+				require.Nil(t, tcpAddr.IP.To4(), "expected an IPv6 address, got %s", tcpAddr.IP)
+			case "":
+				require.True(t, tcpAddr.IP.IsUnspecified(),
+					"empty bind address must remain a wildcard bind, got %s", tcpAddr.IP)
+			}
+
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, s.Stop(stopCtx))
+
+			// The serving goroutine returning http.ErrServerClosed proves both the
+			// listener and the goroutine were released by Stop.
+			select {
+			case err := <-errCh:
+				require.ErrorIs(t, err, http.ErrServerClosed)
+			case <-time.After(5 * time.Second):
+				t.Fatal("serving goroutine did not exit after Stop")
+			}
+		})
+	}
 }
 
 func TestServer_Stop_Idempotency(t *testing.T) {
